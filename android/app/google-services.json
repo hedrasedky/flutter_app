@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "652832477744",
+    "project_id": "precure-hy",
+    "storage_bucket": "precure-hy.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:652832477744:android:78cf829cf179de102593f5",
+        "android_client_info": {
+          "package_name": "com.example.final project"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "652832477744-lvq3e7na15reu1nb78f53ovqim30gsoh.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDiyESZckwzxbQ99Bbb0a6XcPiJmSBSp0A"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "652832477744-lvq3e7na15reu1nb78f53ovqim30gsoh.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
