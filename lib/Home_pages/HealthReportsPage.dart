@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart'; // تم التعديل هنا
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:precure/theme/gradient_background.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:io';
-import 'dart:async'; // تم التعديل هنا
+import 'dart:async';
+import 'dart:convert';
 
 class HealthReportsPage extends StatefulWidget {
   const HealthReportsPage({super.key});
@@ -19,7 +21,7 @@ class _HealthReportsPageState extends State<HealthReportsPage> {
   final ThemeMode _currentTheme = ThemeMode.light;
   Color _primaryColor = Colors.blue.shade700;
 
-  final FlutterBluePlus flutterBlue = FlutterBluePlus(); // تم التعديل هنا
+  final FlutterBluePlus flutterBlue = FlutterBluePlus();
   BluetoothDevice? _connectedDevice;
   double currentHeartRate = 65.0;
   List<double> weeklyHeartRates = [65, 70, 68, 67, 72, 75, 74];
@@ -55,47 +57,103 @@ class _HealthReportsPageState extends State<HealthReportsPage> {
     const FlSpot(28, 72),
     const FlSpot(29, 75),
   ];
+  late SharedPreferences _prefs;
 
   @override
   void initState() {
     super.initState();
+    _initPreferences();
     scanForDevices();
   }
 
+  Future<void> _initPreferences() async {
+    _prefs = await SharedPreferences.getInstance();
+    _loadStoredData();
+  }
+
+  void _loadStoredData() {
+    setState(() {
+      // Load current heart rate
+      currentHeartRate = _prefs.getDouble('currentHeartRate') ?? 65.0;
+
+      // Load weekly data
+      String? weeklyData = _prefs.getString('weeklyHeartRates');
+      if (weeklyData != null) {
+        weeklyHeartRates = (jsonDecode(weeklyData) as List).cast<double>();
+      }
+
+      // Load monthly data
+      String? monthlyData = _prefs.getString('monthlyHeartRates');
+      if (monthlyData != null) {
+        List<dynamic> decoded = jsonDecode(monthlyData);
+        monthlyHeartRates = decoded.asMap().entries.map((entry) {
+          return FlSpot(entry.key.toDouble(), entry.value.toDouble());
+        }).toList();
+      }
+    });
+  }
+
   void scanForDevices() {
-    FlutterBluePlus.startScan(
-        timeout: const Duration(seconds: 5)); // تم التعديل هنا
+    FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
     FlutterBluePlus.scanResults.listen((results) {
-      // تم التعديل هنا
       for (ScanResult scanResult in results) {
-        // تم التعديل هنا
         if (scanResult.device.name == "YourSmartWatch") {
           connectToDevice(scanResult.device);
+          break;
         }
       }
     });
   }
 
   void connectToDevice(BluetoothDevice device) async {
-    await device.connect(autoConnect: false); // تم التعديل هنا
+    await device.connect(autoConnect: false);
+    setState(() {
+      _connectedDevice = device;
+    });
     discoverServices(device);
   }
 
   void discoverServices(BluetoothDevice device) async {
-    List<BluetoothService> services =
-        await device.discoverServices(); // تم التعديل هنا
+    List<BluetoothService> services = await device.discoverServices();
     for (BluetoothService service in services) {
       for (BluetoothCharacteristic characteristic in service.characteristics) {
         if (characteristic.uuid.toString() == "UUID_HeartRate") {
-          await characteristic.setNotifyValue(true); // تم التعديل هنا
+          await characteristic.setNotifyValue(true);
           characteristic.value.listen((value) {
-            setState(() {
-              currentHeartRate = value[0].toDouble();
-            });
+            double newHeartRate = value[0].toDouble();
+            _updateHeartRateData(newHeartRate);
           });
         }
       }
     }
+  }
+
+  void _updateHeartRateData(double newHeartRate) async {
+    setState(() {
+      currentHeartRate = newHeartRate;
+    });
+
+    // Save current heart rate
+    await _prefs.setDouble('currentHeartRate', newHeartRate);
+
+    // Get current date for tracking
+    DateTime now = DateTime.now();
+    int dayOfWeek = now.weekday - 1; // 0 (Monday) to 6 (Sunday)
+    int dayOfMonth = now.day - 1; // 0 to 29 (assuming 30-day month for simplicity)
+
+    // Update weekly data
+    weeklyHeartRates[dayOfWeek] = newHeartRate;
+    await _prefs.setString('weeklyHeartRates', jsonEncode(weeklyHeartRates));
+
+    // Update monthly data
+    monthlyHeartRates[dayOfMonth] = FlSpot(dayOfMonth.toDouble(), newHeartRate);
+    await _prefs.setString(
+        'monthlyHeartRates',
+        jsonEncode(monthlyHeartRates.map((spot) => spot.y).toList())
+    );
+
+    // Trigger UI update
+    setState(() {});
   }
 
   Future<void> _downloadReport() async {
@@ -143,10 +201,15 @@ class _HealthReportsPageState extends State<HealthReportsPage> {
       monthlyHeartRates = List.generate(30, (index) => FlSpot(index.toDouble(), 0.0));
     });
 
-    // Simulate live data updates
+    // Save reset data
+    _prefs.setDouble('currentHeartRate', 0);
+    _prefs.setString('weeklyHeartRates', jsonEncode(weeklyHeartRates));
+    _prefs.setString('monthlyHeartRates', jsonEncode(monthlyHeartRates.map((spot) => spot.y).toList()));
+
+    // Simulate live data updates (kept for manual refresh)
     Timer.periodic(const Duration(seconds: 1), (timer) {
       setState(() {
-        currentHeartRate = 60 + (timer.tick % 20); // Simulated heart rate
+        currentHeartRate = 60 + (timer.tick % 20);
         weeklyHeartRates[timer.tick % 7] = currentHeartRate.toDouble();
         monthlyHeartRates[timer.tick % 30] = FlSpot(
           (timer.tick % 30).toDouble(),
@@ -154,10 +217,21 @@ class _HealthReportsPageState extends State<HealthReportsPage> {
         );
       });
 
+      // Save simulated data
+      _prefs.setDouble('currentHeartRate', currentHeartRate);
+      _prefs.setString('weeklyHeartRates', jsonEncode(weeklyHeartRates));
+      _prefs.setString('monthlyHeartRates', jsonEncode(monthlyHeartRates.map((spot) => spot.y).toList()));
+
       if (timer.tick >= 30) {
         timer.cancel();
       }
     });
+  }
+
+  @override
+  void dispose() {
+    _connectedDevice?.disconnect();
+    super.dispose();
   }
 
   @override
@@ -322,87 +396,86 @@ class _HealthReportsPageState extends State<HealthReportsPage> {
     );
   }
 
-Widget _buildWeeklyReport() {
-  return Card(
-    elevation: 4,
-    shape: RoundedRectangleBorder(
-      borderRadius: BorderRadius.circular(16),
-    ),
-    child: Padding(
-      padding: const EdgeInsets.all(20), // توحيد الحشو مع التصميم الشهري
-      child: Column(
-        children: [
-          const Text(
-            'Weekly Heart Rate Comparison',
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-          const SizedBox(height: 16), // توحيد المسافة مع التصميم الشهري
-          SizedBox(
-            height: 400, // جعل الارتفاع متساوي مع التصميم الشهري
-            child: BarChart(
-              BarChartData(
-                alignment: BarChartAlignment.spaceAround,
-                maxY: 120, // نفس القيمة القصوى للتصميم الشهري
-                minY: 40,  // نفس القيمة الدنيا للتصميم الشهري
-                barGroups: _buildWeeklyBarGroups(),
-                titlesData: FlTitlesData(
-                  leftTitles: AxisTitles(
-                    sideTitles: SideTitles(
-                      showTitles: true,
-                      interval: 20, // نفس التباعد للتصميم الشهري
-                      reservedSize: 40, // نفس المساحة المحجوزة
-                      getTitlesWidget: (value, meta) {
-                        return Padding(
-                          padding: const EdgeInsets.only(right: 4),
-                          child: Text(
-                            '${value.toInt()} BPM', // إضافة BPM كما في التصميم الشهري
-                            style: const TextStyle(
-                              fontSize: 12,
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                  bottomTitles: AxisTitles(
-                    sideTitles: SideTitles(
-                      showTitles: true,
-                      getTitlesWidget: (value, meta) {
-                        return Padding(
-                          padding: const EdgeInsets.only(top: 1.0),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              
-                              Text(
-                                "Day ${meta.formattedValue}", // إضافة تسمية اليوم
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                ),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                  topTitles: const AxisTitles(),
-                  rightTitles: const AxisTitles(),
-                ),
-                gridData: const FlGridData(show: true),
-                borderData: FlBorderData(show: true),
+  Widget _buildWeeklyReport() {
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            const Text(
+              'Weekly Heart Rate Comparison',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
               ),
             ),
-          ),
-          const SizedBox(height: 8),
-        ],
+            const SizedBox(height: 16),
+            SizedBox(
+              height: 400,
+              child: BarChart(
+                BarChartData(
+                  alignment: BarChartAlignment.spaceAround,
+                  maxY: 120,
+                  minY: 40,
+                  barGroups: _buildWeeklyBarGroups(),
+                  titlesData: FlTitlesData(
+                    leftTitles: AxisTitles(
+                      sideTitles: SideTitles(
+                        showTitles: true,
+                        interval: 20,
+                        reservedSize: 40,
+                        getTitlesWidget: (value, meta) {
+                          return Padding(
+                            padding: const EdgeInsets.only(right: 4),
+                            child: Text(
+                              '${value.toInt()} BPM',
+                              style: const TextStyle(
+                                fontSize: 12,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    bottomTitles: AxisTitles(
+                      sideTitles: SideTitles(
+                        showTitles: true,
+                        getTitlesWidget: (value, meta) {
+                          return Padding(
+                            padding: const EdgeInsets.only(top: 1.0),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  "Day ${meta.formattedValue}",
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    topTitles: const AxisTitles(),
+                    rightTitles: const AxisTitles(),
+                  ),
+                  gridData: const FlGridData(show: true),
+                  borderData: FlBorderData(show: true),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
       ),
-    ),
-  );
-}
+    );
+  }
 
   List<BarChartGroupData> _buildWeeklyBarGroups() {
     return weeklyHeartRates.asMap().entries.map((entry) {
@@ -412,7 +485,7 @@ Widget _buildWeeklyReport() {
         x: index,
         barRods: [
           BarChartRodData(
-            toY: heartRate,
+            toY: heartRate > 0 ? heartRate : 40, // Default to 40 if no data
             color: _primaryColor,
             width: 12,
           ),
@@ -421,88 +494,89 @@ Widget _buildWeeklyReport() {
     }).toList();
   }
 
-Widget _buildMonthlyReport() {
-  return Card(
-    elevation: 4,
-    shape: RoundedRectangleBorder(
-      borderRadius: BorderRadius.circular(16),
-    ),
-    child: Padding(
-      padding: const EdgeInsets.all(20),
-      child: Column(
-        children: [
-          const Text(
-            'Monthly Heart Rate Trends',
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
+  Widget _buildMonthlyReport() {
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            const Text(
+              'Monthly Heart Rate Trends',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+              ),
             ),
-          ),
-          const SizedBox(height: 16),
-          SizedBox(
-            height: 400,
-            child: LineChart(
-              LineChartData(
-                lineBarsData: [
-                  LineChartBarData(
-                    spots: monthlyHeartRates,
-                    isCurved: true,
-                    color: _primaryColor,
-                    barWidth: 2,
-                    belowBarData: BarAreaData(
-                      show: true,
-                      color: _primaryColor.withOpacity(0.1),
+            const SizedBox(height: 16),
+            SizedBox(
+              height: 400,
+              child: LineChart(
+                LineChartData(
+                  lineBarsData: [
+                    LineChartBarData(
+                      spots: monthlyHeartRates,
+                      isCurved: true,
+                      color: _primaryColor,
+                      barWidth: 2,
+                      belowBarData: BarAreaData(
+                        show: true,
+                        color: _primaryColor.withOpacity(0.1),
+                      ),
+                      dotData: const FlDotData(show: false),
                     ),
-                    dotData: const FlDotData(show: false),
-                  ),
-                ],
-                titlesData: FlTitlesData(
-                  leftTitles: AxisTitles(
-                    sideTitles: SideTitles(
-                      showTitles: true,
-                      interval: 20, // تباعد مناسب لقياسات القلب
-                      reservedSize: 40, // مساحة كافية للنصوص
-                      getTitlesWidget: (value, meta) {
-                        return Padding(
-                          padding: const EdgeInsets.only(right: 4),
-                          child: Text(
-                            '${value.toInt()} BPM', // إضافة BPM هنا
+                  ],
+                  titlesData: FlTitlesData(
+                    leftTitles: AxisTitles(
+                      sideTitles: SideTitles(
+                        showTitles: true,
+                        interval: 20,
+                        reservedSize: 40,
+                        getTitlesWidget: (value, meta) {
+                          return Padding(
+                            padding: const EdgeInsets.only(right: 4),
+                            child: Text(
+                              '${value.toInt()} BPM',
+                              style: const TextStyle(
+                                fontSize: 12,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    bottomTitles: AxisTitles(
+                      sideTitles: SideTitles(
+                        showTitles: true,
+                        getTitlesWidget: (value, meta) {
+                          return Text(
+                            '${value.toInt()}',
                             style: const TextStyle(
                               fontSize: 12,
                             ),
-                          ),
-                        );
-                      },
+                          );
+                        },
+                      ),
                     ),
+                    rightTitles: const AxisTitles(),
+                    topTitles: const AxisTitles(),
                   ),
-                  bottomTitles: AxisTitles(
-                    sideTitles: SideTitles(
-                      showTitles: true,
-                      getTitlesWidget: (value, meta) {
-                        return Text(
-                          '${value.toInt()}',
-                          style: const TextStyle(
-                            fontSize: 12,
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                  rightTitles: const AxisTitles(),
-                  topTitles: const AxisTitles(),
+                  gridData: const FlGridData(show: true),
+                  borderData: FlBorderData(show: true),
+                  minY: 40,
+                  maxY: 120,
                 ),
-                gridData: const FlGridData(show: true),
-                borderData: FlBorderData(show: true),
-                minY: 40, // أقل معدل طبيعي للقلب
-                maxY: 120, // أعلى معدل طبيعي للقلب
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
-    ),
-  );
-}
+    );
+  }
+
   Widget _buildActionButtons() {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,

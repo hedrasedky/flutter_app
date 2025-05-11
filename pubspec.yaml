@@ -46,6 +46,7 @@ dependencies:
   audioplayers: ^5.2.1
   flutter_local_notifications: ^17.2.1+2
   flutter_animate: ^4.5.0
+  logging: ^1.2.0
   
   flutter_localizations:
     sdk: flutter
@@ -128,4 +129,4 @@ flutter:
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
 dependency_overrides:
-  flutter_blue_plus: ^1.31.14
+  flutter_blue_plus: ^1.32.0

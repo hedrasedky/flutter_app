@@ -1,4 +1,3 @@
-
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:heart_bpm/heart_bpm.dart';
@@ -12,14 +11,18 @@ import 'package:camera/camera.dart';
 import 'package:image/image.dart' as img;
 import 'package:sensors_plus/sensors_plus.dart';
 import 'dart:math';
-
-// استيراد StreamController
+import 'package:logging/logging.dart';
 import 'bpm_stream.dart';
 
 class BiometricDataPage extends StatefulWidget {
   final BluetoothDevice? connectedDevice;
+  final BluetoothCharacteristic? heartRateCharacteristic;
 
-  const BiometricDataPage({super.key, required this.connectedDevice});
+  const BiometricDataPage({
+    super.key,
+    required this.connectedDevice,
+    this.heartRateCharacteristic,
+  });
 
   @override
   _BiometricDataPageState createState() => _BiometricDataPageState();
@@ -37,28 +40,39 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
   Timer? _analysisTimer;
   final int maxDataPoints = 50;
   double startTime = DateTime.now().millisecondsSinceEpoch.toDouble();
-  String smartwatchName = "No device connected";
+  String smartwatchName = "لا يوجد جهاز متصل";
   List<int> todayBPM = [];
   List<int> yesterdayBPM = [70, 75, 80, 72, 76];
+  StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
+  StreamSubscription<List<int>>? _heartRateSubscription;
+  StreamSubscription<List<int>>? _accelerometerSubscription;
 
   // Accelerometer Variables
-  StreamSubscription<AccelerometerEvent>? _accelerometerSubscription;
+  StreamSubscription<AccelerometerEvent>? _phoneAccelerometerSubscription;
   double _currentAcceleration = 0.0;
-  String _movementStatus = "Stationary";
-  String _accelerometerSource = "Phone";
+  String _movementStatus = "ثابت";
+  String _accelerometerSource = "الهاتف";
   final List<double> _accelerationHistory = [];
   final int _maxAccelerationPoints = 50;
+  final Logger _logger = Logger('BiometricDataPage');
 
   @override
   void initState() {
     super.initState();
+    // تهيئة التسجيل
+    Logger.root.level = Level.ALL;
+    Logger.root.onRecord.listen((record) {
+      print('${record.level.name}: ${record.time}: ${record.message}');
+    });
     requestPermissions();
     connectedDevice = widget.connectedDevice;
+    heartRateCharacteristic = widget.heartRateCharacteristic;
 
-    if (connectedDevice != null) {
+    if (connectedDevice != null && heartRateCharacteristic != null) {
       _initializeHeartRateData();
     } else {
-      startScanAndConnect();
+      _logger.warning("No connected device or characteristic provided");
+      _startAccelerometer();
     }
   }
 
@@ -96,141 +110,152 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
   }
 
   void _checkCriticalHeartRate(int bpm) {
-    // إرسال BPM وحالة الحركة إلى EmergencyAlertsPage
     if (bpm < 60 || bpm > 100) {
+      _logger.info("Critical heart rate detected: $bpm bpm, movement: $_movementStatus");
       bpmStreamController.add(BPMWithMovement(bpm: bpm, movementStatus: _movementStatus));
     }
   }
 
   Future<void> _initializeHeartRateData() async {
     try {
-      var services = await connectedDevice!.discoverServices();
-      bool accelerometerFound = false;
+      if (connectedDevice == null || heartRateCharacteristic == null) {
+        _logger.warning("Cannot initialize: device or characteristic is null");
+        return;
+      }
 
-      for (var service in services) {
-        if (service.uuid.toString().toLowerCase().contains("180d")) {
-          for (var char in service.characteristics) {
-            if (char.uuid.toString().toLowerCase().contains("2a37")) {
-              heartRateCharacteristic = char;
-              await char.setNotifyValue(true);
-              
-              connectedDevice!.connectionState.listen((state) {
-                if (state == BluetoothConnectionState.disconnected) {
-                  if (mounted) {
-                    setState(() {
-                      smartwatchBPM = 0;
-                      smartwatchName = "Disconnected";
-                      _accelerometerSource = "Phone";
-                    });
-                  }
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('Disconnected from ${connectedDevice!.name}')),
-                  );
-                  Future.delayed(const Duration(seconds: 3), () {
-                    if (!connectedDevice!.isConnected) {
-                      _initializeHeartRateData();
-                    }
-                  });
-                }
-              });
+      // مراقبة حالة الاتصال
+      _connectionSubscription?.cancel();
+      _connectionSubscription = connectedDevice!.connectionState.listen((state) {
+        _logger.info("Connection state for ${connectedDevice!.name}: $state");
+        if (state == BluetoothConnectionState.disconnected) {
+          if (mounted) {
+            setState(() {
+              smartwatchBPM = 0;
+              smartwatchName = "غير متصل";
+              _accelerometerSource = "الهاتف";
+            });
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('تم قطع الاتصال بـ ${connectedDevice!.name}')),
+            );
+          }
+          _startAccelerometer();
+        }
+      });
 
-              char.value.listen((value) {
-                int bpm = _parseHeartRate(value);
-                if (_isValidHeartRate(bpm)) {
-                  if (_movementStatus == "Running" && bpm > 100) {
-                    print('High BPM due to running - ignoring');
-                    return;
-                  }
-                  
-                  double time = (DateTime.now().millisecondsSinceEpoch.toDouble() - startTime) / 1000;
-                  setState(() {
-                    smartwatchBPM = bpm;
-                    heartRateData.add(FlSpot(time, bpm.toDouble()));
-                    todayBPM.add(bpm);
+      // استماع بيانات معدل ضربات القلب
+      _heartRateSubscription?.cancel();
+      await heartRateCharacteristic!.setNotifyValue(true);
+      _heartRateSubscription = heartRateCharacteristic!.value.listen((value) {
+        int bpm = _parseHeartRate(value);
+        if (_isValidHeartRate(bpm)) {
+          if (_movementStatus == "جري" && bpm > 100) {
+            _logger.info('High BPM due to running - ignoring: $bpm');
+            return;
+          }
 
-                    if (heartRateData.length > maxDataPoints * 2) {
-                      heartRateData.removeRange(0, heartRateData.length - maxDataPoints);
-                    }
+          double time = (DateTime.now().millisecondsSinceEpoch.toDouble() - startTime) / 1000;
+          if (mounted) {
+            setState(() {
+              smartwatchBPM = bpm;
+              heartRateData.add(FlSpot(time, bpm.toDouble()));
+              todayBPM.add(bpm);
 
-                    if (todayBPM.length > 500) {
-                      todayBPM.removeRange(0, todayBPM.length - 500);
-                    }
-                  });
-                  _checkCriticalHeartRate(bpm);
-                }
-              });
-              
-              smartwatchName = connectedDevice!.name.isNotEmpty
-                  ? connectedDevice!.name
-                  : "Unnamed Device";
-              startPeriodicUpdates();
-            }
+              if (heartRateData.length > maxDataPoints * 2) {
+                heartRateData.removeRange(0, heartRateData.length - maxDataPoints);
+              }
+
+              if (todayBPM.length > 500) {
+                todayBPM.removeRange(0, todayBPM.length - 500);
+              }
+            });
+            _checkCriticalHeartRate(bpm);
+            saveToFile(bpm);
           }
         }
+      });
+
+      // البحث عن خدمة التسارع
+      var services = await connectedDevice!.discoverServices();
+      bool accelerometerFound = false;
+      for (var service in services) {
         if (service.uuid.toString().toLowerCase().contains("1816")) {
           for (var char in service.characteristics) {
             if (char.uuid.toString().toLowerCase().contains("2a5d") || char.properties.notify) {
               accelerometerCharacteristic = char;
               await char.setNotifyValue(true);
               accelerometerFound = true;
-              
-              char.value.listen((value) {
+
+              _accelerometerSubscription?.cancel();
+              _accelerometerSubscription = char.value.listen((value) {
                 double acceleration = _parseAccelerometerData(value);
-                
-                setState(() {
-                  _currentAcceleration = acceleration;
-                  _accelerationHistory.add(acceleration);
-                  _accelerometerSource = "Watch";
-                  
-                  if (_accelerationHistory.length > _maxAccelerationPoints) {
-                    _accelerationHistory.removeAt(0);
-                  }
-                  
-                  if (acceleration > 15) {
-                    _movementStatus = "Running";
-                  } else if (acceleration > 8) {
-                    _movementStatus = "Walking";
-                  } else {
-                    _movementStatus = "Stationary";
-                  }
-                });
+                if (mounted) {
+                  setState(() {
+                    _currentAcceleration = acceleration;
+                    _accelerationHistory.add(acceleration);
+                    _accelerometerSource = "الساعة";
+
+                    if (_accelerationHistory.length > _maxAccelerationPoints) {
+                      _accelerationHistory.removeAt(0);
+                    }
+
+                    if (acceleration > 15) {
+                      _movementStatus = "جري";
+                    } else if (acceleration > 8) {
+                      _movementStatus = "مشي";
+                    } else {
+                      _movementStatus = "ثابت";
+                    }
+                  });
+                }
               });
             }
           }
         }
       }
 
+      smartwatchName = connectedDevice!.name.isNotEmpty
+          ? connectedDevice!.name
+          : "جهاز غير معروف";
+      startPeriodicUpdates();
+
       if (!accelerometerFound) {
+        _logger.info("No accelerometer service found, using phone accelerometer");
         _startAccelerometer();
       }
     } catch (e) {
-      print("Error during initialization: $e");
+      _logger.severe("Error during initialization: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('خطأ في التهيئة: $e')),
+        );
+      }
       _startAccelerometer();
     }
   }
 
   void _startAccelerometer() {
-    _accelerometerSubscription?.cancel();
-    _accelerometerSubscription = accelerometerEvents.listen((AccelerometerEvent event) {
+    _phoneAccelerometerSubscription?.cancel();
+    _phoneAccelerometerSubscription = accelerometerEvents.listen((AccelerometerEvent event) {
       double acceleration = _calculateAcceleration(event);
-      
-      setState(() {
-        _currentAcceleration = acceleration;
-        _accelerationHistory.add(acceleration);
-        _accelerometerSource = "Phone";
-        
-        if (_accelerationHistory.length > _maxAccelerationPoints) {
-          _accelerationHistory.removeAt(0);
-        }
-        
-        if (acceleration > 15) {
-          _movementStatus = "Running";
-        } else if (acceleration > 8) {
-          _movementStatus = "Walking";
-        } else {
-          _movementStatus = "Stationary";
-        }
-      });
+      if (mounted) {
+        setState(() {
+          _currentAcceleration = acceleration;
+          _accelerationHistory.add(acceleration);
+          _accelerometerSource = "الهاتف";
+
+          if (_accelerationHistory.length > _maxAccelerationPoints) {
+            _accelerationHistory.removeAt(0);
+          }
+
+          if (acceleration > 15) {
+            _movementStatus = "جري";
+          } else if (acceleration > 8) {
+            _movementStatus = "مشي";
+          } else {
+            _movementStatus = "ثابت";
+          }
+        });
+      }
     });
   }
 
@@ -239,122 +264,36 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
   }
 
   void _stopAccelerometer() {
-    _accelerometerSubscription?.cancel();
+    _phoneAccelerometerSubscription?.cancel();
   }
 
   Future<void> requestPermissions() async {
-    await Permission.bluetooth.request();
-    await Permission.bluetoothScan.request();
-    await Permission.bluetoothConnect.request();
-    await Permission.camera.request();
-    await Permission.sensors.request();
-  }
-
-  void startScanAndConnect() async {
-    FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
-
-    FlutterBluePlus.scanResults.listen((results) async {
-      for (ScanResult result in results) {
-        if (result.advertisementData.serviceUuids.contains("180D") ||
-            result.device.name.isNotEmpty) {
-          try {
-            await result.device.connect(timeout: const Duration(seconds: 10));
-            if (!mounted) {
-              return setState(() {
-                smartwatchName = result.device.name.isNotEmpty
-                    ? result.device.name
-                    : "Unnamed Device";
-              });
-            }
-            var services = await result.device.discoverServices();
-            bool accelerometerFound = false;
-
-            for (var service in services) {
-              if (service.uuid.toString().toLowerCase().contains("180d")) {
-                for (var char in service.characteristics) {
-                  if (char.uuid.toString().toLowerCase().contains("2a37")) {
-                    heartRateCharacteristic = char;
-                    await char.setNotifyValue(true);
-                    char.value.listen((value) {
-                      if (value.isNotEmpty && value.length > 1) {
-                        int bpm = _parseHeartRate(value);
-                        double time = (DateTime.now().millisecondsSinceEpoch.toDouble() - startTime) / 1000;
-                        setState(() {
-                          smartwatchBPM = bpm;
-                          heartRateData.add(FlSpot(time, bpm.toDouble()));
-                          todayBPM.add(bpm);
-                          if (heartRateData.length > maxDataPoints) {
-                            heartRateData.removeAt(0);
-                          }
-                        });
-                        _checkCriticalHeartRate(bpm);
-                        saveToFile(bpm);
-                      }
-                    });
-                  }
-                }
-              }
-              if (service.uuid.toString().toLowerCase().contains("1816")) {
-                for (var char in service.characteristics) {
-                  if (char.uuid.toString().toLowerCase().contains("2a5d") || char.properties.notify) {
-                    accelerometerCharacteristic = char;
-                    await char.setNotifyValue(true);
-                    accelerometerFound = true;
-                    
-                    char.value.listen((value) {
-                      double acceleration = _parseAccelerometerData(value);
-                      
-                      setState(() {
-                        _currentAcceleration = acceleration;
-                        _accelerationHistory.add(acceleration);
-                        _accelerometerSource = "Watch";
-                        
-                        if (_accelerationHistory.length > _maxAccelerationPoints) {
-                          _accelerationHistory.removeAt(0);
-                        }
-                        
-                        if (acceleration > 15) {
-                          _movementStatus = "Running";
-                        } else if (acceleration > 8) {
-                          _movementStatus = "Walking";
-                        } else {
-                          _movementStatus = "Stationary";
-                        }
-                      });
-                    });
-                  }
-                }
-              }
-            }
-            FlutterBluePlus.stopScan();
-            startPeriodicUpdates();
-            if (!accelerometerFound) {
-              _startAccelerometer();
-            }
-            break;
-          } on Exception catch (e) {
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text('Connection failed: ${e.toString()}')),
-              );
-            }
-            await FlutterBluePlus.stopScan();
-          }
-        }
+    var statuses = await [
+      Permission.bluetooth,
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.camera,
+      Permission.sensors,
+    ].request();
+    if (!statuses.values.every((status) => status.isGranted)) {
+      _logger.warning("Some permissions not granted: $statuses");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('يرجى منح جميع الأذونات المطلوبة')),
+        );
       }
-    });
+    }
   }
 
   void startPeriodicUpdates() {
     updateTimer?.cancel();
-    
     updateTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
-      if (!mounted || heartRateCharacteristic == null || 
-          !(connectedDevice?.isConnected ?? false)) {
+      if (!mounted || heartRateCharacteristic == null || !(await connectedDevice!.isConnected)) {
+        _logger.warning("Stopping periodic updates: not mounted or disconnected");
         updateTimer?.cancel();
         return;
       }
-      
+
       try {
         var value = await heartRateCharacteristic!.read().timeout(const Duration(seconds: 3));
         int bpm = _parseHeartRate(value);
@@ -367,20 +306,26 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
               todayBPM.add(bpm);
             });
             _checkCriticalHeartRate(bpm);
+            saveToFile(bpm);
           }
         }
       } catch (e) {
-        print('Error reading heart rate: $e');
+        _logger.severe('Error reading heart rate: $e');
       }
     });
   }
 
   Future<void> saveToFile(int bpm) async {
-    final directory = await getApplicationDocumentsDirectory();
-    final file = File('${directory.path}/heart_rate_log.txt');
-    final now = DateTime.now();
-    final line = '${now.toIso8601String()} - $bpm - $_movementStatus\n';
-    await file.writeAsString(line, mode: FileMode.append);
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      final file = File('${directory.path}/heart_rate_log.txt');
+      final now = DateTime.now();
+      final line = '${now.toIso8601String()} - $bpm - $_movementStatus\n';
+      await file.writeAsString(line, mode: FileMode.append);
+      _logger.info("Saved heart rate to file: $bpm bpm");
+    } catch (e) {
+      _logger.severe("Error saving to file: $e");
+    }
   }
 
   double compareTodayWithYesterday() {
@@ -395,10 +340,12 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
       MaterialPageRoute(
         builder: (context) => _CameraMeasurementScreen(
           onBPM: (value) {
-            setState(() {
-              phoneCameraBPM = value;
-            });
-            _checkCriticalHeartRate(value);
+            if (mounted) {
+              setState(() {
+                phoneCameraBPM = value;
+              });
+              _checkCriticalHeartRate(value);
+            }
           },
         ),
         fullscreenDialog: true,
@@ -410,11 +357,15 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
   void dispose() {
     updateTimer?.cancel();
     _analysisTimer?.cancel();
+    _connectionSubscription?.cancel();
+    _heartRateSubscription?.cancel();
+    _accelerometerSubscription?.cancel();
     _stopAccelerometer();
     heartRateCharacteristic?.setNotifyValue(false);
     accelerometerCharacteristic?.setNotifyValue(false);
     connectedDevice?.disconnect();
     super.dispose();
+    _logger.info("BiometricDataPage disposed");
   }
 
   @override
@@ -423,7 +374,7 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text("Biometric Data"),
+        title: const Text("البيانات البيومترية"),
         backgroundColor: theme.appBarTheme.backgroundColor,
         foregroundColor: theme.appBarTheme.foregroundColor,
       ),
@@ -455,7 +406,7 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
               ),
               const SizedBox(height: 20),
               Text(
-                "Connected to: $smartwatchName",
+                "متصل بـ: $smartwatchName",
                 style: TextStyle(
                   color: theme.textTheme.bodyMedium?.color,
                   fontSize: 16,
@@ -464,30 +415,24 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
               Row(
                 children: [
                   Icon(
-                    connectedDevice?.isConnected ?? false 
-                      ? Icons.bluetooth_connected
-                      : Icons.bluetooth_disabled,
-                    color: connectedDevice?.isConnected ?? false 
-                      ? Colors.green 
-                      : Colors.red,
+                    connectedDevice?.isConnected ?? false
+                        ? Icons.bluetooth_connected
+                        : Icons.bluetooth_disabled,
+                    color: connectedDevice?.isConnected ?? false ? Colors.green : Colors.red,
                   ),
                   const SizedBox(width: 8),
                   Text(
-                    connectedDevice?.isConnected ?? false 
-                      ? "Connected" 
-                      : "Disconnected",
+                    connectedDevice?.isConnected ?? false ? "متصل" : "غير متصل",
                     style: TextStyle(
-                      color: connectedDevice?.isConnected ?? false 
-                        ? Colors.green 
-                        : Colors.red,
+                      color: connectedDevice?.isConnected ?? false ? Colors.green : Colors.red,
                     ),
                   ),
                 ],
               ),
               const SizedBox(height: 4),
               _buildCard(
-                title: "Smartwatch",
-                value: smartwatchBPM > 0 ? "$smartwatchBPM bpm" : "0 bpm",
+                title: "الساعة الذكية",
+                value: smartwatchBPM > 0 ? "$smartwatchBPM نبضة/دقيقة" : "0 نبضة/دقيقة",
                 gradientColors: [
                   const Color.fromARGB(255, 54, 47, 46),
                   Colors.red.shade700,
@@ -525,20 +470,21 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
                       )
                     : const Center(
                         child: Text(
-                          "No Heart Rate Data",
+                          "لا توجد بيانات لمعدل ضربات القلب",
                           style: TextStyle(
                             color: Color.fromARGB(255, 255, 254, 254),
                             fontSize: 20,
                           ),
                         ),
                       ),
-                additionalInfo: "Acceleration: ${_currentAcceleration.toStringAsFixed(2)} m/s²\nStatus: $_movementStatus\nSource: $_accelerometerSource",
+                additionalInfo:
+                    "التسارع: ${_currentAcceleration.toStringAsFixed(2)} م/ث²\nالحالة: $_movementStatus\nالمصدر: $_accelerometerSource",
                 additionalIcon: Icons.directions_run,
               ),
               const SizedBox(height: 20),
               _buildCard(
-                title: "Phone Camera",
-                value: phoneCameraBPM > 0 ? "$phoneCameraBPM bpm" : "0 bpm",
+                title: "كاميرا الهاتف",
+                value: phoneCameraBPM > 0 ? "$phoneCameraBPM نبضة/دقيقة" : "0 نبضة/دقيقة",
                 gradientColors: [
                   const Color.fromARGB(255, 54, 47, 46),
                   Colors.red.shade700,
@@ -556,7 +502,7 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
                         ),
                       ),
                       child: Text(
-                        "Measure Now",
+                        "القياس الآن",
                         style: TextStyle(color: theme.primaryColor),
                       ),
                     ),
@@ -569,7 +515,7 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
                         ),
                       ),
                       child: Text(
-                        "Update Data",
+                        "تحديث البيانات",
                         style: TextStyle(color: theme.primaryColor),
                       ),
                     ),
@@ -578,7 +524,7 @@ class _BiometricDataPageState extends State<BiometricDataPage> {
               ),
               const SizedBox(height: 10),
               Text(
-                "Difference from yesterday: ${compareTodayWithYesterday().toStringAsFixed(1)} bpm",
+                "الفرق عن أمس: ${compareTodayWithYesterday().toStringAsFixed(1)} نبضة/دقيقة",
                 style: TextStyle(
                   color: theme.textTheme.bodyMedium?.color,
                   fontSize: 16,
@@ -710,7 +656,8 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
   bool measurementCompleted = false;
   double _lastLightLevel = 0;
   int _noFingerCounter = 0;
-  String _movementStatus = "Stationary"; // Default value for movement status
+  final String _movementStatus = "ثابت";
+  final Logger _logger = Logger('CameraMeasurementScreen');
 
   @override
   void initState() {
@@ -719,21 +666,30 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
   }
 
   Future<void> _initializeCamera() async {
-    final cameras = await availableCameras();
-    final backCamera = cameras.firstWhere(
-      (camera) => camera.lensDirection == CameraLensDirection.back,
-    );
+    try {
+      final cameras = await availableCameras();
+      final backCamera = cameras.firstWhere(
+        (camera) => camera.lensDirection == CameraLensDirection.back,
+      );
 
-    _controller = CameraController(
-      backCamera,
-      ResolutionPreset.medium,
-      enableAudio: false,
-    );
+      _controller = CameraController(
+        backCamera,
+        ResolutionPreset.medium,
+        enableAudio: false,
+      );
 
-    await _controller.initialize();
-    if (mounted) {
-      setState(() => _isCameraInitialized = true);
-      _startLightAnalysis();
+      await _controller.initialize();
+      if (mounted) {
+        setState(() => _isCameraInitialized = true);
+        _startLightAnalysis();
+      }
+    } catch (e) {
+      _logger.severe("Error initializing camera: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('خطأ في تهيئة الكاميرا: $e')),
+        );
+      }
     }
   }
 
@@ -749,18 +705,20 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
         final lightLevel = _calculateLightLevel(image);
         final lightChange = (lightLevel - _lastLightLevel).abs();
 
-        setState(() {
-          if (lightChange > 20 && lightLevel < 100) {
-            isFingerOnSensor = true;
-            _noFingerCounter = 0;
-          } else {
-            _noFingerCounter++;
-            if (_noFingerCounter > 3) {
-              isFingerOnSensor = false;
+        if (mounted) {
+          setState(() {
+            if (lightChange > 20 && lightLevel < 100) {
+              isFingerOnSensor = true;
+              _noFingerCounter = 0;
+            } else {
+              _noFingerCounter++;
+              if (_noFingerCounter > 3) {
+                isFingerOnSensor = false;
+              }
             }
-          }
-          _lastLightLevel = lightLevel;
-        });
+            _lastLightLevel = lightLevel;
+          });
+        }
 
         if (isFingerOnSensor && !isMeasuring && !measurementCompleted) {
           _startMeasurement();
@@ -770,7 +728,7 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
 
         await File(frame.path).delete();
       } catch (e) {
-        print('Error analyzing frame: $e');
+        _logger.severe('Error analyzing frame: $e');
       }
     });
   }
@@ -785,16 +743,20 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
   }
 
   void _startMeasurement() {
-    setState(() {
-      isMeasuring = true;
-      progress = 0;
-      measurementCompleted = false;
-      measuredBPM = null;
-    });
+    if (mounted) {
+      setState(() {
+        isMeasuring = true;
+        progress = 0;
+        measurementCompleted = false;
+        measuredBPM = null;
+      });
+    }
 
     progressTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
       if (progress < 100) {
-        setState(() => progress += 2);
+        if (mounted) {
+          setState(() => progress += 2);
+        }
       } else {
         timer.cancel();
         _completeMeasurement();
@@ -803,10 +765,12 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
   }
 
   void _completeMeasurement() {
-    setState(() {
-      isMeasuring = false;
-      measurementCompleted = true;
-    });
+    if (mounted) {
+      setState(() {
+        isMeasuring = false;
+        measurementCompleted = true;
+      });
+    }
 
     showDialog(
       context: context,
@@ -814,10 +778,12 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
       builder: (context) => HeartBPMDialog(
         context: context,
         onBPM: (value) {
-          setState(() => measuredBPM = value);
-          widget.onBPM(value);
-          _checkCriticalHeartRate(value);
-          Navigator.of(context).pop();
+          if (mounted) {
+            setState(() => measuredBPM = value);
+            widget.onBPM(value);
+            _checkCriticalHeartRate(value);
+            Navigator.of(context).pop();
+          }
         },
       ),
     );
@@ -825,17 +791,20 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
 
   void _checkCriticalHeartRate(int bpm) {
     if (bpm < 60 || bpm > 100) {
+      _logger.info("Critical heart rate detected: $bpm bpm, movement: $_movementStatus");
       bpmStreamController.add(BPMWithMovement(bpm: bpm, movementStatus: _movementStatus));
     }
   }
 
   void _resetMeasurement() {
     progressTimer?.cancel();
-    setState(() {
-      isMeasuring = false;
-      progress = 0;
-      measurementCompleted = false;
-    });
+    if (mounted) {
+      setState(() {
+        isMeasuring = false;
+        progress = 0;
+        measurementCompleted = false;
+      });
+    }
   }
 
   @override
@@ -844,6 +813,7 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
     progressTimer?.cancel();
     _controller.dispose();
     super.dispose();
+    _logger.info("CameraMeasurementScreen disposed");
   }
 
   @override
@@ -906,7 +876,7 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   const Text(
-                    'Measurement Complete',
+                    'اكتمل القياس',
                     style: TextStyle(
                       color: Colors.green,
                       fontSize: 24,
@@ -915,7 +885,7 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
                   ),
                   const SizedBox(height: 20),
                   Text(
-                    '$measuredBPM BPM',
+                    '$measuredBPM نبضة/دقيقة',
                     style: const TextStyle(
                       color: Colors.white,
                       fontSize: 36,
@@ -931,8 +901,8 @@ class _CameraMeasurementScreenState extends State<_CameraMeasurementScreen> {
             right: 0,
             child: Text(
               isFingerOnSensor
-                  ? 'Keep your finger on the camera'
-                  : 'Cover the camera completely with your finger',
+                  ? 'حافظ على إصبعك على الكاميرا'
+                  : 'غطِ الكاميرا بالكامل بإصبعك',
               textAlign: TextAlign.center,
               style: const TextStyle(
                 color: Colors.white,

@@ -641,7 +641,7 @@ class _EmergencyAlertsPageState extends State<EmergencyAlertsPage> {
                                 value: status,
                                 child: Text(status.capitalize()),
                               ))
-                          .toList(),
+                          ,
                     ],
                     onChanged: (value) {
                       setState(() {
@@ -662,7 +662,7 @@ class _EmergencyAlertsPageState extends State<EmergencyAlertsPage> {
                                 value: movement,
                                 child: Text(movement),
                               ))
-                          .toList(),
+                          ,
                     ],
                     onChanged: (value) {
                       setState(() {
